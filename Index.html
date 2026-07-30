@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phyrexian Meta Aggregator</title>
+<style>
+  :root{
+    --bg:#101312; --panel:#181D1B; --panel2:#1F2523; --line:#2C3431;
+    --text:#E6E1D3; --dim:#9AA69F; --oil:#9BC53D; --oildark:#4F7A28;
+    --bone:#D8D3C4; --warn:#E0A458; --err:#D96C4F; --blue:#6FB3C7;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:15px}
+  .wrap{max-width:680px;margin:0 auto;padding:20px 16px 40px}
+  .brand{color:var(--oil);font-size:11px;letter-spacing:.2em}
+  h1{font-size:22px;margin:6px 0 2px}
+  .sub{color:var(--dim);font-size:13px}
+  .rule{border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:18px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;margin-top:14px}
+  label{display:block;color:var(--dim);font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin:10px 0 4px}
+  input,select,textarea{width:100%;background:var(--panel2);color:var(--text);
+    border:1px solid var(--line);border-radius:6px;padding:10px 12px;font:inherit}
+  textarea{min-height:120px}
+  .row{display:flex;gap:10px}
+  .row>div{flex:1}
+  button{font:inherit;border:none;border-radius:8px;padding:10px 14px;cursor:pointer}
+  .go{width:100%;background:var(--oil);color:#0C0F0B;font-weight:700;font-size:15px;padding:12px;margin-top:14px}
+  .go:disabled{background:var(--oildark);opacity:.7}
+  .ghost{background:var(--panel2);color:var(--text);border:1px solid var(--line);font-size:13px}
+  .tab{background:var(--panel);color:var(--text);border:1px solid var(--line);font-size:13px}
+  .tab.on{background:var(--oil);color:#0C0F0B;font-weight:700;border-color:var(--oil)}
+  .chip{display:inline-block;background:var(--panel);border:1px solid var(--line);
+    border-radius:999px;padding:4px 12px;font-size:12px;margin:0 6px 6px 0}
+  .status{color:var(--dim);font-size:13px;margin-top:8px}
+  .error{border-color:var(--warn);color:var(--warn);font-size:13px}
+  .tier-h{font-weight:700;font-size:13px;letter-spacing:.05em;margin-bottom:10px}
+  .cardrow{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .cname{flex:0 0 46%;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .barbg{flex:1;background:var(--panel2);border-radius:3px;height:6px;overflow:hidden}
+  .bar{height:100%}
+  .cnum{flex:0 0 72px;font-size:12px;color:var(--dim);text-align:right}
+  .entry{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:13px;margin-bottom:8px}
+  .entry .meta{color:var(--dim);font-size:12px}
+  .conslist{font-size:12px;line-height:1.7;max-height:220px;overflow-y:auto;color:var(--bone)}
+  details{margin-top:10px} summary{color:var(--dim);font-size:12px;cursor:pointer}
+  .foot{color:var(--dim);font-size:11px;margin-top:24px;border-top:1px solid var(--line);padding-top:10px}
+  .flexbtw{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+  .copybtn{background:var(--oil);color:#0C0F0B;font-weight:700;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="rule">
+    <div class="brand">PHYREXIANMTG · TOURNAMENT DATA</div>
+    <h1>Meta Aggregator</h1>
+    <div class="sub">Commander in → every qualifying top-finish list out → frequency tiers + consensus 100.</div>
+  </div>
+
+  <div class="panel">
+    <label>Commander (exact edhtop16 name — pairings use " / ")</label>
+    <input id="commander" value="Leonardo, the Balance / Michelangelo, the Heart">
+    <div class="row">
+      <div><label>Window</label>
+        <select id="tp">
+          <option value="ONE_MONTH">1 month</option>
+          <option value="THREE_MONTHS" selected>3 months</option>
+          <option value="SIX_MONTHS">6 months</option>
+          <option value="ONE_YEAR">1 year</option>
+        </select></div>
+      <div><label>Min event size</label><input id="minSize" type="number" value="50"></div>
+      <div><label>Max standing</label><input id="maxStanding" type="number" value="16"></div>
+    </div>
+    <label>Tell card — optional archetype splitter (e.g. Ad Nauseam)</label>
+    <input id="tell" placeholder="leave blank for one combined pool">
+    <button class="go" id="run">Pull the field</button>
+    <div class="status" id="status"></div>
+    <details>
+      <summary>Paste mode — analyze lists you paste in manually</summary>
+      <label>One list per block, each starting with a # header line</label>
+      <textarea id="paste" placeholder="# Pilot A — Event X
+Ad Nauseam
+Dark Ritual
+…
+
+# Pilot B — Event Y
+Force of Will
+…"></textarea>
+      <button class="ghost" id="loadPaste" style="margin-top:8px">Load pasted lists</button>
+    </details>
+  </div>
+
+  <div class="panel error" id="errbox" style="display:none"></div>
+
+  <div id="results" style="display:none">
+    <div id="chips" style="margin-top:16px"></div>
+    <div style="margin:6px 0 12px">
+      <button class="tab on" data-tab="tiers">Card tiers</button>
+      <button class="tab" data-tab="lists">Entries</button>
+      <button class="tab" data-tab="consensus">Consensus 100</button>
+      <button class="ghost" id="csvbtn">Copy CSV</button>
+    </div>
+    <div id="pane"></div>
+  </div>
+
+  <div class="foot">Data: edhtop16.com (TopDeck.gg results). Frequency ≠ optimal — it's the field's center of gravity.</div>
+</div>
+
+<script>
+const PROXY = "/api/edhtop16"; // same-origin Pages Function — no CORS
+const CARD_FIELDS = ["maindeck { name }","cards { name }","mainboard { name }"];
+let state = { entries:null, clientFiltered:false, tab:"tiers" };
+
+const $ = id => document.getElementById(id);
+
+function buildQuery(cardField, useFilters){
+  const f = useFilters ? `, filters: { timePeriod: $tp, minEventSize: $minSize, maxStanding: $maxStanding }` : "";
+  const v = useFilters
+    ? `$name: String!, $first: Int!, $after: String, $tp: TimePeriod!, $minSize: Int!, $maxStanding: Int!`
+    : `$name: String!, $first: Int!, $after: String`;
+  return `query Agg(${v}) { commander(name: $name) { name
+    entries(first: $first, after: $after${f}) {
+      edges { node { standing wins losses draws decklist
+        player { name } tournament { name size tournamentDate } ${cardField} } }
+      pageInfo { hasNextPage endCursor } } } }`;
+}
+
+async function gql(query, variables){
+  const res = await fetch(PROXY, { method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({query, variables}) });
+  const text = await res.text();
+  let json; try{ json = JSON.parse(text); }
+  catch{ throw new Error(`HTTP ${res.status} — non-JSON: ${text.slice(0,180)}`); }
+  if (json.errors && json.errors.length){
+    const e = new Error(json.errors.map(x=>x.message).join(" | ")); e.graphql = true; throw e;
+  }
+  return json.data;
+}
+
+const extractCards = n => {
+  for (const k of ["maindeck","cards","mainboard"])
+    if (Array.isArray(n[k])) return n[k].map(c=>typeof c==="string"?c:c&&c.name).filter(Boolean);
+  return null;
+};
+const parseDate = v => {
+  if (v==null) return null;
+  if (typeof v==="number") return new Date(v>1e12?v:v*1000);
+  const d = new Date(v); return isNaN(d)?null:d;
+};
+const monthsAgo = n => { const d=new Date(); d.setMonth(d.getMonth()-n); return d; };
+
+async function run(){
+  $("run").disabled = true; $("errbox").style.display="none"; $("results").style.display="none";
+  $("status").textContent = "Contacting edhtop16…";
+  const name = $("commander").value.trim(), tp = $("tp").value;
+  const minSize = +$("minSize").value, maxStanding = +$("maxStanding").value;
+  let works = null, lastErr = "";
+  outer:
+  for (const useFilters of [true,false]) for (const cf of CARD_FIELDS){
+    const q = buildQuery(cf, useFilters);
+    const vars = useFilters ? {name, first:5, after:null, tp, minSize, maxStanding} : {name, first:5, after:null};
+    try{
+      const d = await gql(q, vars);
+      if (d && d.commander && d.commander.entries){ works = {q, useFilters}; break outer; }
+      lastErr = "commander not found — check the exact edhtop16 spelling";
+    }catch(e){
+      lastErr = String(e.message);
+      if (!e.graphql){ showError(lastErr); return done(); }
+    }
+  }
+  if (!works){ showError("No accepted query shape. Last error: " + lastErr); return done(); }
+  const all = []; let after = null;
+  try{
+    for (let p=0; p<12; p++){
+      $("status").textContent = `Fetching page ${p+1}… (${all.length} entries so far)`;
+      const vars = works.useFilters ? {name, first:50, after, tp, minSize, maxStanding} : {name, first:50, after};
+      const d = await gql(works.q, vars);
+      const conn = d && d.commander && d.commander.entries; if (!conn) break;
+      for (const {node} of (conn.edges||[])){
+        all.push({ pilot:(node.player&&node.player.name)||"unknown",
+          tournament:(node.tournament&&node.tournament.name)||"unknown event",
+          size:node.tournament?node.tournament.size:null,
+          date:parseDate(node.tournament?node.tournament.tournamentDate:null),
+          standing:node.standing==null?null:node.standing,
+          cards:extractCards(node)||[] });
+      }
+      if (!conn.pageInfo || !conn.pageInfo.hasNextPage) break;
+      after = conn.pageInfo.endCursor;
+    }
+  }catch(e){ showError("Pagination stopped early: " + e.message); }
+  let final = all;
+  state.clientFiltered = false;
+  if (!works.useFilters){
+    const cutoff = monthsAgo(tp==="ONE_MONTH"?1:tp==="THREE_MONTHS"?3:tp==="SIX_MONTHS"?6:12);
+    final = all.filter(e =>
+      (e.size==null || e.size>=minSize) &&
+      (e.standing==null || e.standing<=maxStanding) &&
+      (e.date==null || e.date>=cutoff));
+    state.clientFiltered = true;
+  }
+  final = final.filter(e => e.cards.length>0);
+  if (!final.length && !$("errbox").textContent) showError("Query worked but returned zero qualifying lists — loosen the filters or check the commander name.");
+  state.entries = final;
+  render();
+  done();
+}
+function done(){ $("run").disabled=false; $("status").textContent=""; }
+function showError(msg){ const b=$("errbox"); b.textContent=msg; b.style.display="block"; }
+
+$("run").onclick = run;
+$("loadPaste").onclick = () => {
+  const blocks = $("paste").value.split(/\n(?=#)/).map(b=>b.trim()).filter(Boolean);
+  const out = [];
+  for (const b of blocks){
+    const lines = b.split("\n").map(l=>l.trim()).filter(Boolean);
+    const header = lines[0] && lines[0].startsWith("#") ? lines.shift().replace(/^#+\s*/,"") : `List ${out.length+1}`;
+    const cards = lines.map(l=>l.replace(/^\d+x?\s+/,""));
+    if (cards.length) out.push({pilot:header, tournament:"pasted", size:null, date:null, standing:null, cards});
+  }
+  if (!out.length){ showError("No lists found — start each list with a # header line."); return; }
+  $("errbox").style.display="none";
+  state.entries = out; state.clientFiltered = false; render();
+};
+
+function analyze(){
+  const entries = state.entries; if (!entries || !entries.length) return null;
+  const cmdNames = $("commander").value.split("/").map(s=>s.trim()).filter(Boolean);
+  const cleaned = entries.map(e=>({...e, cards:e.cards.filter(c=>!cmdNames.includes(c))}));
+  const seen = new Set(); let dupPairs = 0;
+  for (const e of cleaned){
+    const key = [...e.cards].sort().join("|");
+    if (seen.has(key)) dupPairs++; else seen.add(key);
+  }
+  const tell = $("tell").value.trim().toLowerCase();
+  const campA = tell ? cleaned.filter(e=>e.cards.some(c=>c.toLowerCase()===tell)) : cleaned;
+  const campB = tell ? cleaned.filter(e=>!e.cards.some(c=>c.toLowerCase()===tell)) : [];
+  const count = list => { const m=new Map(); for (const e of list) for (const c of e.cards) m.set(c,(m.get(c)||0)+1); return m; };
+  const cA=count(campA), cB=count(campB), NA=campA.length, NB=campB.length;
+  const rows=[];
+  for (const card of new Set([...cA.keys(),...cB.keys()])){
+    const a=cA.get(card)||0, b=cB.get(card)||0, fa=NA?a/NA:0, fb=NB?b/NB:0;
+    let tier;
+    if (!tell) tier = a===NA?"CORE":a>=NA*0.5?"MAJORITY":a>1?"CONTESTED":"FRINGE";
+    else if (a===NA && b===NB) tier="CORE";
+    else if (a>=Math.max(2,NA*0.6) && fa-fb>=0.5) tier="A";
+    else if (b>=Math.max(2,NB*0.6) && fb-fa>=0.5) tier="B";
+    else if (a+b<=1) tier="FRINGE";
+    else tier="CONTESTED";
+    rows.push({card,a,b,fa,fb,tier});
+  }
+  rows.sort((x,y)=> (y.a+y.b)-(x.a+x.b) || x.card.localeCompare(y.card));
+  const consensus = m => [...m.entries()].sort((x,y)=>y[1]-x[1]||x[0].localeCompare(y[0])).slice(0,98).map(x=>x[0]);
+  return {cleaned, dupPairs, tell, NA, NB, rows,
+    consA: NA?consensus(cA):[], consB: NB?consensus(cB):[], cmdNames};
+}
+
+const TIER_META = t => ({
+  CORE:{label:"Core — in every list", color:"var(--oil)"},
+  A:{label:`Has "${$("tell").value.trim()}" — defining`, color:"var(--blue)"},
+  B:{label:`No "${$("tell").value.trim()}" — defining`, color:"var(--warn)"},
+  MAJORITY:{label:"Majority (50%+)", color:"var(--blue)"},
+  CONTESTED:{label:"Contested", color:"var(--bone)"},
+  FRINGE:{label:"Fringe / one-offs", color:"var(--dim)"},
+}[t]);
+
+function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;"); }
+
+function render(){
+  const A = analyze(); if (!A) return;
+  $("results").style.display = "block";
+  let chips = `<span class="chip">${A.cleaned.length} lists</span>`;
+  if (A.tell) chips += `<span class="chip" style="color:var(--blue)">${A.NA} with tell</span>
+    <span class="chip" style="color:var(--warn)">${A.NB} without</span>`;
+  if (A.dupPairs) chips += `<span class="chip" style="color:var(--warn);border-color:var(--warn)">${A.dupPairs} identical duplicate${A.dupPairs>1?"s":""}</span>`;
+  if (state.clientFiltered) chips += `<span class="chip" style="color:var(--dim)">filtered client-side</span>`;
+  $("chips").innerHTML = chips;
+  const pane = $("pane");
+  if (state.tab==="tiers"){
+    let h = "";
+    for (const t of ["CORE","A","B","MAJORITY","CONTESTED","FRINGE"]){
+      const rs = A.rows.filter(r=>r.tier===t); if (!rs.length) continue;
+      const meta = TIER_META(t), cap = t==="FRINGE"?20:500;
+      h += `<div class="panel"><div class="tier-h" style="color:${meta.color}">${esc(meta.label)} · ${rs.length}</div>`;
+      for (const r of rs.slice(0,cap)){
+        h += `<div class="cardrow"><div class="cname">${esc(r.card)}</div>
+          <div class="barbg"><div class="bar" style="width:${Math.round(r.fa*100)}%;background:${meta.color}"></div></div>
+          <div class="cnum">${r.a}/${A.NA}${A.tell?` · ${r.b}/${A.NB}`:""}</div></div>`;
+      }
+      if (t==="FRINGE" && rs.length>cap) h += `<div class="sub">…and ${rs.length-cap} more (in CSV export)</div>`;
+      h += `</div>`;
+    }
+    pane.innerHTML = h;
+  } else if (state.tab==="lists"){
+    pane.innerHTML = A.cleaned.map(e=>`<div class="entry"><b>${esc(e.pilot)}</b>
+      <div class="meta">${esc(e.tournament)}${e.size?` · ${e.size} players`:""}${e.standing?` · #${e.standing}`:""}${e.date?` · ${e.date.toLocaleDateString()}`:""} · ${e.cards.length} cards${e.cards.length!==98&&e.cards.length!==99?" ⚠️":""}</div></div>`).join("");
+  } else {
+    const mox = cards => [...A.cmdNames.map(c=>`1 ${c}`), ...cards.map(c=>`1 ${c}`)].join("\n");
+    const block = (cards, label, key) => `<div class="panel"><div class="flexbtw">
+      <div style="font-weight:700;font-size:13px">${esc(label)}</div>
+      <button class="copybtn" onclick="copyText(this, \`${mox(cards).replace(/`/g,"")}\`)">Copy Moxfield 100</button></div>
+      <div class="sub" style="margin:8px 0">Top 98 by frequency + the commander${A.cmdNames.length>1?"s":""}. Frequency composite — sanity-check the tail slots.</div>
+      <div class="conslist">${cards.map(esc).join(" · ")}</div></div>`;
+    let h = block(A.consA, A.tell?`With "${$("tell").value.trim()}" (${A.NA} lists)`:`Combined field (${A.NA} lists)`, "A");
+    if (A.tell && A.NB) h += block(A.consB, `Without "${$("tell").value.trim()}" (${A.NB} lists)`, "B");
+    pane.innerHTML = h;
+  }
+}
+
+window.copyText = async (btn, text) => {
+  try{ await navigator.clipboard.writeText(text); }
+  catch{ const ta=document.createElement("textarea"); ta.value=text; document.body.appendChild(ta);
+    ta.select(); document.execCommand("copy"); document.body.removeChild(ta); }
+  const old = btn.textContent; btn.textContent = "Copied ✓"; setTimeout(()=>btn.textContent=old, 1500);
+};
+
+document.querySelectorAll(".tab").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on"); state.tab = b.dataset.tab; render();
+});
+$("csvbtn").onclick = () => {
+  const A = analyze(); if (!A) return;
+  const csv = ["card,campA_count,campA_n,campB_count,campB_n,tier",
+    ...A.rows.map(r=>`"${r.card.replace(/"/g,'""')}",${r.a},${A.NA},${r.b},${A.NB},${r.tier}`)].join("\n");
+  copyText($("csvbtn"), csv);
+};
+</script>
+</body>
+</html>
