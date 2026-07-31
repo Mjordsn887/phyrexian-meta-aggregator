@@ -110,7 +110,7 @@ Force of Will
 <script>
 const PROXY = "/api/edhtop16"; // same-origin Pages Function — no CORS
 const CARD_FIELDS = ["maindeck { name }","cards { name }","mainboard { name }"];
-let state = { entries:null, clientFiltered:false, tab:"tiers" };
+let state = { entries:null, clientFiltered:false, tab:"tiers", apiName:null };
 
 const $ = id => document.getElementById(id);
 
@@ -153,6 +153,7 @@ const monthsAgo = n => { const d=new Date(); d.setMonth(d.getMonth()-n); return 
 
 async function run(){
   $("run").disabled = true; $("errbox").style.display="none"; $("results").style.display="none";
+  state.apiName = null;
   $("status").textContent = "Contacting edhtop16…";
   const name = $("commander").value.trim(), tp = $("tp").value;
   const minSize = +$("minSize").value, maxStanding = +$("maxStanding").value;
@@ -178,6 +179,7 @@ async function run(){
       const vars = works.useFilters ? {name, first:50, after, tp, minSize, maxStanding} : {name, first:50, after};
       const d = await gql(works.q, vars);
       const conn = d && d.commander && d.commander.entries; if (!conn) break;
+      if (d.commander.name) state.apiName = d.commander.name;
       for (const {node} of (conn.edges||[])){
         all.push({ pilot:(node.player&&node.player.name)||"unknown",
           tournament:(node.tournament&&node.tournament.name)||"unknown event",
@@ -221,12 +223,13 @@ $("loadPaste").onclick = () => {
   }
   if (!out.length){ showError("No lists found — start each list with a # header line."); return; }
   $("errbox").style.display="none";
-  state.entries = out; state.clientFiltered = false; render();
+  state.entries = out; state.clientFiltered = false; state.apiName = null; render();
 };
 
 function analyze(){
   const entries = state.entries; if (!entries || !entries.length) return null;
-  const cmdNames = $("commander").value.split("/").map(s=>s.trim()).filter(Boolean);
+  const cmdSource = state.apiName || $("commander").value;
+  const cmdNames = cmdSource.split(" / ").map(s=>s.trim()).filter(Boolean);
   const cleaned = entries.map(e=>({...e, cards:e.cards.filter(c=>!cmdNames.includes(c))}));
   const seen = new Set(); let dupPairs = 0;
   for (const e of cleaned){
@@ -236,6 +239,7 @@ function analyze(){
   const tell = $("tell").value.trim().toLowerCase();
   const campA = tell ? cleaned.filter(e=>e.cards.some(c=>c.toLowerCase()===tell)) : cleaned;
   const campB = tell ? cleaned.filter(e=>!e.cards.some(c=>c.toLowerCase()===tell)) : [];
+  const slots = Math.max(1, 100 - Math.max(1, cmdNames.length)); // 99 solo, 98 partners
   const count = list => { const m=new Map(); for (const e of list) for (const c of e.cards) m.set(c,(m.get(c)||0)+1); return m; };
   const cA=count(campA), cB=count(campB), NA=campA.length, NB=campB.length;
   const rows=[];
@@ -251,8 +255,8 @@ function analyze(){
     rows.push({card,a,b,fa,fb,tier});
   }
   rows.sort((x,y)=> (y.a+y.b)-(x.a+x.b) || x.card.localeCompare(y.card));
-  const consensus = m => [...m.entries()].sort((x,y)=>y[1]-x[1]||x[0].localeCompare(y[0])).slice(0,98).map(x=>x[0]);
-  return {cleaned, dupPairs, tell, NA, NB, rows,
+  const consensus = m => [...m.entries()].sort((x,y)=>y[1]-x[1]||x[0].localeCompare(y[0])).slice(0,slots).map(x=>x[0]);
+  return {cleaned, dupPairs, tell, NA, NB, rows, slots,
     consA: NA?consensus(cA):[], consB: NB?consensus(cB):[], cmdNames};
 }
 
@@ -270,7 +274,8 @@ function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;"); }
 function render(){
   const A = analyze(); if (!A) return;
   $("results").style.display = "block";
-  let chips = `<span class="chip">${A.cleaned.length} lists</span>`;
+  let chips = state.apiName ? `<span class="chip" style="color:var(--oil)">${esc(state.apiName)}</span>` : "";
+  chips += `<span class="chip">${A.cleaned.length} lists</span>`;
   if (A.tell) chips += `<span class="chip" style="color:var(--blue)">${A.NA} with tell</span>
     <span class="chip" style="color:var(--warn)">${A.NB} without</span>`;
   if (A.dupPairs) chips += `<span class="chip" style="color:var(--warn);border-color:var(--warn)">${A.dupPairs} identical duplicate${A.dupPairs>1?"s":""}</span>`;
@@ -300,7 +305,7 @@ function render(){
     const block = (cards, label, key) => `<div class="panel"><div class="flexbtw">
       <div style="font-weight:700;font-size:13px">${esc(label)}</div>
       <button class="copybtn" onclick="copyText(this, \`${mox(cards).replace(/`/g,"")}\`)">Copy Moxfield 100</button></div>
-      <div class="sub" style="margin:8px 0">Top 98 by frequency + the commander${A.cmdNames.length>1?"s":""}. Frequency composite — sanity-check the tail slots.</div>
+      <div class="sub" style="margin:8px 0">Top ${A.slots} by frequency + the commander${A.cmdNames.length>1?"s":""} = 100. Frequency composite — sanity-check the tail slots.</div>
       <div class="conslist">${cards.map(esc).join(" · ")}</div></div>`;
     let h = block(A.consA, A.tell?`With "${$("tell").value.trim()}" (${A.NA} lists)`:`Combined field (${A.NA} lists)`, "A");
     if (A.tell && A.NB) h += block(A.consB, `Without "${$("tell").value.trim()}" (${A.NB} lists)`, "B");
