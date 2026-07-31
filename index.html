@@ -109,8 +109,15 @@ Force of Will
 
 <script>
 const PROXY = "/api/edhtop16"; // same-origin Pages Function — no CORS
-const CARD_FIELDS = ["maindeck { name }","cards { name }","mainboard { name }"];
-let state = { entries:null, clientFiltered:false, tab:"tiers", apiName:null };
+const SCRYFALL = "https://api.scryfall.com/cards/collection"; // CORS-open
+const BASICS = new Set(["Plains","Island","Swamp","Mountain","Forest","Wastes",
+  "Snow-Covered Plains","Snow-Covered Island","Snow-Covered Swamp","Snow-Covered Mountain","Snow-Covered Forest","Snow-Covered Wastes"]);
+const CARD_FIELDS = [
+  "maindeck { name quantity }","maindeck { name count }",
+  "cards { name quantity }","cards { name count }",
+  "maindeck { name }","cards { name }","mainboard { name }"
+];
+let state = { entries:null, clientFiltered:false, tab:"tiers", apiName:null, landSet:null, landWarn:false };
 
 const $ = id => document.getElementById(id);
 
@@ -140,8 +147,15 @@ async function gql(query, variables){
 }
 
 const extractCards = n => {
-  for (const k of ["maindeck","cards","mainboard"])
-    if (Array.isArray(n[k])) return n[k].map(c=>typeof c==="string"?c:c&&c.name).filter(Boolean);
+  for (const k of ["maindeck","cards","mainboard"]){
+    if (Array.isArray(n[k])){
+      return n[k].map(c => {
+        if (typeof c === "string") return { name:c, qty:1 };
+        if (c && c.name) return { name:c.name, qty:Number(c.quantity ?? c.count ?? 1) || 1 };
+        return null;
+      }).filter(Boolean);
+    }
+  }
   return null;
 };
 const parseDate = v => {
@@ -150,6 +164,41 @@ const parseDate = v => {
   const d = new Date(v); return isNaN(d)?null:d;
 };
 const monthsAgo = n => { const d=new Date(); d.setMonth(d.getMonth()-n); return d; };
+
+async function classifyLands(names){
+  const landSet = new Set();
+  const list = [...names];
+  for (let i=0; i<list.length; i+=75){
+    const batch = list.slice(i, i+75);
+    const res = await fetch(SCRYFALL, { method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ identifiers: batch.map(n=>({name:n})) }) });
+    if (!res.ok) throw new Error(`Scryfall HTTP ${res.status}`);
+    const j = await res.json();
+    for (const c of (j.data||[])){
+      if ((c.type_line||"").includes("Land")){
+        landSet.add(c.name);
+        landSet.add(c.name.split(" // ")[0]);
+      }
+    }
+    if (i+75 < list.length) await new Promise(r=>setTimeout(r,120));
+  }
+  return landSet;
+}
+
+async function finishLoad(entries){
+  state.landWarn = false;
+  const names = new Set();
+  for (const e of entries) for (const c of e.cards) names.add(c.name);
+  try{
+    $("status").textContent = `Classifying ${names.size} unique cards via Scryfall…`;
+    state.landSet = await classifyLands(names);
+  }catch(err){
+    state.landSet = null; state.landWarn = true;
+  }
+  state.entries = entries;
+  render();
+}
 
 async function run(){
   $("run").disabled = true; $("errbox").style.display="none"; $("results").style.display="none";
@@ -204,47 +253,74 @@ async function run(){
   }
   final = final.filter(e => e.cards.length>0);
   if (!final.length && !$("errbox").textContent) showError("Query worked but returned zero qualifying lists — loosen the filters or check the commander name.");
-  state.entries = final;
-  render();
+  await finishLoad(final);
   done();
 }
 function done(){ $("run").disabled=false; $("status").textContent=""; }
 function showError(msg){ const b=$("errbox"); b.textContent=msg; b.style.display="block"; }
 
 $("run").onclick = run;
-$("loadPaste").onclick = () => {
+$("loadPaste").onclick = async () => {
   const blocks = $("paste").value.split(/\n(?=#)/).map(b=>b.trim()).filter(Boolean);
   const out = [];
   for (const b of blocks){
     const lines = b.split("\n").map(l=>l.trim()).filter(Boolean);
     const header = lines[0] && lines[0].startsWith("#") ? lines.shift().replace(/^#+\s*/,"") : `List ${out.length+1}`;
-    const cards = lines.map(l=>l.replace(/^\d+x?\s+/,""));
+    const cards = lines.map(l => {
+      const m = l.match(/^(\d+)x?\s+(.+)$/);
+      return m ? { name:m[2], qty:+m[1] } : { name:l, qty:1 };
+    });
     if (cards.length) out.push({pilot:header, tournament:"pasted", size:null, date:null, standing:null, cards});
   }
   if (!out.length){ showError("No lists found — start each list with a # header line."); return; }
   $("errbox").style.display="none";
-  state.entries = out; state.clientFiltered = false; state.apiName = null; render();
+  state.clientFiltered = false; state.apiName = null;
+  $("loadPaste").disabled = true;
+  await finishLoad(out);
+  $("loadPaste").disabled = false;
 };
+
+const isLand = n => state.landSet ? state.landSet.has(n) : BASICS.has(n);
 
 function analyze(){
   const entries = state.entries; if (!entries || !entries.length) return null;
   const cmdSource = state.apiName || $("commander").value;
   const cmdNames = cmdSource.split(" / ").map(s=>s.trim()).filter(Boolean);
-  const cleaned = entries.map(e=>({...e, cards:e.cards.filter(c=>!cmdNames.includes(c))}));
+  const cmdCount = Math.max(1, cmdNames.length);
+  const slots = Math.max(1, 100 - cmdCount); // 99 solo, 98 partners
+  // strip commanders, then infer hidden basic-land copies from each list's card deficit
+  const cleaned = entries.map(e => {
+    const cards = e.cards.filter(c=>!cmdNames.includes(c.name)).map(c=>({...c}));
+    const tot = cards.reduce((s,c)=>s+c.qty,0);
+    const deficit = slots - tot;
+    if (deficit > 0){
+      const basics = cards.filter(c=>BASICS.has(c.name)).sort((a,b)=>b.qty-a.qty);
+      if (basics.length) basics[0].qty += deficit;
+    }
+    return {...e, cards};
+  });
   const seen = new Set(); let dupPairs = 0;
   for (const e of cleaned){
-    const key = [...e.cards].sort().join("|");
+    const key = e.cards.map(c=>c.name+"×"+c.qty).sort().join("|");
     if (seen.has(key)) dupPairs++; else seen.add(key);
   }
   const tell = $("tell").value.trim().toLowerCase();
-  const campA = tell ? cleaned.filter(e=>e.cards.some(c=>c.toLowerCase()===tell)) : cleaned;
-  const campB = tell ? cleaned.filter(e=>!e.cards.some(c=>c.toLowerCase()===tell)) : [];
-  const slots = Math.max(1, 100 - Math.max(1, cmdNames.length)); // 99 solo, 98 partners
-  const count = list => { const m=new Map(); for (const e of list) for (const c of e.cards) m.set(c,(m.get(c)||0)+1); return m; };
-  const cA=count(campA), cB=count(campB), NA=campA.length, NB=campB.length;
+  const campA = tell ? cleaned.filter(e=>e.cards.some(c=>c.name.toLowerCase()===tell)) : cleaned;
+  const campB = tell ? cleaned.filter(e=>!e.cards.some(c=>c.name.toLowerCase()===tell)) : [];
+  const tally = list => {
+    const pres=new Map(), qty=new Map();
+    for (const e of list) for (const c of e.cards){
+      pres.set(c.name,(pres.get(c.name)||0)+1);
+      qty.set(c.name,(qty.get(c.name)||0)+c.qty);
+    }
+    return {pres, qty};
+  };
+  const A = tally(campA), B = tally(campB);
+  const NA = campA.length, NB = campB.length;
   const rows=[];
-  for (const card of new Set([...cA.keys(),...cB.keys()])){
-    const a=cA.get(card)||0, b=cB.get(card)||0, fa=NA?a/NA:0, fb=NB?b/NB:0;
+  for (const card of new Set([...A.pres.keys(),...B.pres.keys()])){
+    const a=A.pres.get(card)||0, b=B.pres.get(card)||0, fa=NA?a/NA:0, fb=NB?b/NB:0;
+    const q=((A.qty.get(card)||0)+(B.qty.get(card)||0))/Math.max(1,a+b);
     let tier;
     if (!tell) tier = a===NA?"CORE":a>=NA*0.5?"MAJORITY":a>1?"CONTESTED":"FRINGE";
     else if (a===NA && b===NB) tier="CORE";
@@ -252,12 +328,44 @@ function analyze(){
     else if (b>=Math.max(2,NB*0.6) && fb-fa>=0.5) tier="B";
     else if (a+b<=1) tier="FRINGE";
     else tier="CONTESTED";
-    rows.push({card,a,b,fa,fb,tier});
+    rows.push({card,a,b,fa,fb,avgQty:q,tier,land:isLand(card)});
   }
   rows.sort((x,y)=> (y.a+y.b)-(x.a+x.b) || x.card.localeCompare(y.card));
-  const consensus = m => [...m.entries()].sort((x,y)=>y[1]-x[1]||x[0].localeCompare(y[0])).slice(0,slots).map(x=>x[0]);
-  return {cleaned, dupPairs, tell, NA, NB, rows, slots,
-    consA: NA?consensus(cA):[], consB: NB?consensus(cB):[], cmdNames};
+  const landAvg = list => {
+    if (!list.length) return 0;
+    const tot = list.reduce((s,e)=> s + e.cards.reduce((t,c)=> t + (isLand(c.name)?c.qty:0), 0), 0);
+    return Math.round(tot/list.length);
+  };
+  const consensus = (T, N, list) => {
+    if (!N) return {cards:[], landCount:0, nonlandCount:0};
+    const lt = Math.min(slots, landAvg(list));
+    const ranked = [...T.pres.entries()].sort((x,y)=>y[1]-x[1]||x[0].localeCompare(y[0]));
+    const lands = ranked.filter(([n])=>isLand(n)), nonlands = ranked.filter(([n])=>!isLand(n));
+    const fill = (pool, budget) => {
+      const out=[]; let rem=budget;
+      for (const [n,p] of pool){
+        if (rem<=0) break;
+        let q = Math.max(1, Math.round((T.qty.get(n)||p)/p));
+        q = Math.min(q, rem);
+        out.push({name:n, qty:q}); rem -= q;
+      }
+      return {out, rem};
+    };
+    const nl = fill(nonlands, slots - lt);
+    const ld = fill(lands, lt + nl.rem);
+    let rem = ld.rem;
+    if (rem > 0){
+      const b = ld.out.find(c=>BASICS.has(c.name));
+      if (b) { b.qty += rem; rem = 0; }
+      else { const extra = fill(nonlands.slice(nl.out.length), rem); ld.out.push(...extra.out); rem = extra.rem; }
+    }
+    const cards = [...nl.out, ...ld.out];
+    const landCount = cards.reduce((s,c)=> s + (isLand(c.name)?c.qty:0), 0);
+    const nonlandCount = cards.reduce((s,c)=> s + (isLand(c.name)?0:c.qty), 0);
+    return {cards, landCount, nonlandCount};
+  };
+  return {cleaned, dupPairs, tell, NA, NB, rows, slots, cmdCount,
+    consA: consensus(A, NA, campA), consB: consensus(B, NB, campB), cmdNames};
 }
 
 const TIER_META = t => ({
@@ -280,6 +388,7 @@ function render(){
     <span class="chip" style="color:var(--warn)">${A.NB} without</span>`;
   if (A.dupPairs) chips += `<span class="chip" style="color:var(--warn);border-color:var(--warn)">${A.dupPairs} identical duplicate${A.dupPairs>1?"s":""}</span>`;
   if (state.clientFiltered) chips += `<span class="chip" style="color:var(--dim)">filtered client-side</span>`;
+  if (state.landWarn) chips += `<span class="chip" style="color:var(--err);border-color:var(--err)">Scryfall unreachable — land targeting limited to basics</span>`;
   $("chips").innerHTML = chips;
   const pane = $("pane");
   if (state.tab==="tiers"){
@@ -289,7 +398,8 @@ function render(){
       const meta = TIER_META(t), cap = t==="FRINGE"?20:500;
       h += `<div class="panel"><div class="tier-h" style="color:${meta.color}">${esc(meta.label)} · ${rs.length}</div>`;
       for (const r of rs.slice(0,cap)){
-        h += `<div class="cardrow"><div class="cname">${esc(r.card)}</div>
+        const qtyTag = r.avgQty>=1.5 ? ` ×${Math.round(r.avgQty)}` : "";
+        h += `<div class="cardrow"><div class="cname">${esc(r.card)}${qtyTag}</div>
           <div class="barbg"><div class="bar" style="width:${Math.round(r.fa*100)}%;background:${meta.color}"></div></div>
           <div class="cnum">${r.a}/${A.NA}${A.tell?` · ${r.b}/${A.NB}`:""}</div></div>`;
       }
@@ -298,15 +408,19 @@ function render(){
     }
     pane.innerHTML = h;
   } else if (state.tab==="lists"){
-    pane.innerHTML = A.cleaned.map(e=>`<div class="entry"><b>${esc(e.pilot)}</b>
-      <div class="meta">${esc(e.tournament)}${e.size?` · ${e.size} players`:""}${e.standing?` · #${e.standing}`:""}${e.date?` · ${e.date.toLocaleDateString()}`:""} · ${e.cards.length} cards${e.cards.length!==98&&e.cards.length!==99?" ⚠️":""}</div></div>`).join("");
+    pane.innerHTML = A.cleaned.map(e=>{
+      const tot = e.cards.reduce((s,c)=>s+c.qty,0);
+      const lands = e.cards.reduce((s,c)=> s + (isLand(c.name)?c.qty:0), 0);
+      return `<div class="entry"><b>${esc(e.pilot)}</b>
+      <div class="meta">${esc(e.tournament)}${e.size?` · ${e.size} players`:""}${e.standing?` · #${e.standing}`:""}${e.date?` · ${e.date.toLocaleDateString()}`:""} · ${tot} cards · ${lands} lands${tot!==A.slots?" ⚠️":""}</div></div>`;
+    }).join("");
   } else {
-    const mox = cards => [...A.cmdNames.map(c=>`1 ${c}`), ...cards.map(c=>`1 ${c}`)].join("\n");
-    const block = (cards, label, key) => `<div class="panel"><div class="flexbtw">
+    const mox = cards => [...A.cmdNames.map(c=>`1 ${c}`), ...cards.map(c=>`${c.qty} ${c.name}`)].join("\n");
+    const block = (c, label, key) => `<div class="panel"><div class="flexbtw">
       <div style="font-weight:700;font-size:13px">${esc(label)}</div>
-      <button class="copybtn" onclick="copyText(this, \`${mox(cards).replace(/`/g,"")}\`)">Copy Moxfield 100</button></div>
-      <div class="sub" style="margin:8px 0">Top ${A.slots} by frequency + the commander${A.cmdNames.length>1?"s":""} = 100. Frequency composite — sanity-check the tail slots.</div>
-      <div class="conslist">${cards.map(esc).join(" · ")}</div></div>`;
+      <button class="copybtn" onclick="copyText(this, \`${mox(c.cards).replace(/`/g,"")}\`)">Copy Moxfield 100</button></div>
+      <div class="sub" style="margin:8px 0">${c.nonlandCount} nonland + ${c.landCount} lands + ${A.cmdCount} commander${A.cmdCount>1?"s":""} = ${c.nonlandCount+c.landCount+A.cmdCount}. Land count = the camp's real average. Sanity-check the tail slots.</div>
+      <div class="conslist">${c.cards.map(x=> x.qty>1 ? `${esc(x.name)} ×${x.qty}` : esc(x.name)).join(" · ")}</div></div>`;
     let h = block(A.consA, A.tell?`With "${$("tell").value.trim()}" (${A.NA} lists)`:`Combined field (${A.NA} lists)`, "A");
     if (A.tell && A.NB) h += block(A.consB, `Without "${$("tell").value.trim()}" (${A.NB} lists)`, "B");
     pane.innerHTML = h;
@@ -326,8 +440,8 @@ document.querySelectorAll(".tab").forEach(b => b.onclick = () => {
 });
 $("csvbtn").onclick = () => {
   const A = analyze(); if (!A) return;
-  const csv = ["card,campA_count,campA_n,campB_count,campB_n,tier",
-    ...A.rows.map(r=>`"${r.card.replace(/"/g,'""')}",${r.a},${A.NA},${r.b},${A.NB},${r.tier}`)].join("\n");
+  const csv = ["card,campA_presence,campA_n,campB_presence,campB_n,avg_qty,is_land,tier",
+    ...A.rows.map(r=>`"${r.card.replace(/"/g,'""')}",${r.a},${A.NA},${r.b},${A.NB},${r.avgQty.toFixed(2)},${r.land?1:0},${r.tier}`)].join("\n");
   copyText($("csvbtn"), csv);
 };
 </script>
