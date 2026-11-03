@@ -51,6 +51,9 @@
   .suggitem:last-child{border-bottom:none}
   .flexbtw{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
   .copybtn{background:var(--oil);color:#0C0F0B;font-weight:700;font-size:12px}
+  .foot a,.entry a,.error a{color:var(--blue)}
+  .error ol{margin:8px 0 0 18px;padding:0;line-height:1.6}
+  .entry.miss{border-color:var(--warn)}
 </style>
 </head>
 <body>
@@ -114,67 +117,186 @@ Force of Will
     <div id="pane"></div>
   </div>
 
-  <div class="foot">Data: edhtop16.com (TopDeck.gg results). Frequency ≠ optimal — it's the field's center of gravity.</div>
+  <div class="foot">Entries: <a href="https://edhtop16.com" target="_blank" rel="noopener">edhtop16.com</a> · Decklists: <a href="https://topdeck.gg" target="_blank" rel="noopener">TopDeck.gg</a>. Not affiliated with or endorsed by either. Frequency ≠ optimal — it's the field's center of gravity. v6</div>
 </div>
 
 <script>
-const PROXY = "/api/edhtop16"; // same-origin Pages Function — no CORS
+// v6 data flow (edhtop16 stopped accepting query text on 2026-10-19 and no longer serves decklists):
+//   1. /api/edhtop16 {op:"entries"} → edhtop16's own persisted query → qualifying entries (event TID + standing)
+//   2. /api/edhtop16?topdeck=<TID>  → TopDeck.gg API v2 standings → each entry's full decklist
+//   3. Scryfall land classification → tiers + consensus 100 (unchanged from v5)
+const API = "/api/edhtop16"; // same-origin Pages Function
 const SCRYFALL = "https://api.scryfall.com/cards/collection"; // CORS-open
 const BASICS = new Set(["Plains","Island","Swamp","Mountain","Forest","Wastes",
   "Snow-Covered Plains","Snow-Covered Island","Snow-Covered Swamp","Snow-Covered Mountain","Snow-Covered Forest","Snow-Covered Wastes"]);
-const CARD_FIELDS = [
-  "maindeck { name quantity }","maindeck { name count }",
-  "cards { name quantity }","cards { name count }",
-  "maindeck { name }","cards { name }","mainboard { name }"
-];
-let state = { entries:null, clientFiltered:false, tab:"tiers", apiName:null, landSet:null, landWarn:false };
+let state = { entries:null, missing:[], tab:"tiers", apiName:null, landSet:null, landWarn:false, note:"" };
+const tdCache = new Map(); // TID → TopDeck standings, kept for this page session
 
 const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const errText = errs => (Array.isArray(errs) ? errs : [errs]).filter(Boolean)
+  .map(e => typeof e === "string" ? e : (e && (e.message || e.error)) || JSON.stringify(e))
+  .filter(Boolean).join(" | ") || "unknown error (the server sent an empty error list)";
 
-function buildQuery(cardField, useFilters){
-  const f = useFilters ? `, filters: { timePeriod: $tp, minEventSize: $minSize, maxStanding: $maxStanding }` : "";
-  const v = useFilters
-    ? `$name: String!, $first: Int!, $after: String, $tp: TimePeriod!, $minSize: Int!, $maxStanding: Int!`
-    : `$name: String!, $first: Int!, $after: String`;
-  return `query Agg(${v}) { commander(name: $name) { name
-    entries(first: $first, after: $after${f}) {
-      edges { node { standing wins losses draws decklist
-        player { name } tournament { name size tournamentDate } ${cardField} } }
-      pageInfo { hasNextPage endCursor } } } }`;
-}
-
-async function gql(query, variables){
-  const res = await fetch(PROXY, { method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({query, variables}) });
+async function readJson(res, label){
   const text = await res.text();
-  let json; try{ json = JSON.parse(text); }
-  catch{ throw new Error(`HTTP ${res.status} — non-JSON: ${text.slice(0,180)}`); }
-  if (json.errors && json.errors.length){
-    const e = new Error(json.errors.map(x=>x.message).join(" | ")); e.graphql = true; throw e;
-  }
-  return json.data;
+  try { return JSON.parse(text); }
+  catch { throw new Error(`${label} HTTP ${res.status} — ${text ? text.slice(0,180) : "empty response"}`); }
+}
+async function edh(op, variables){
+  const res = await fetch(API, { method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ op, variables }) });
+  return readJson(res, "edhtop16 gateway");
 }
 
-const extractCards = n => {
-  for (const k of ["maindeck","cards","mainboard"]){
-    if (Array.isArray(n[k])){
-      return n[k].map(c => {
-        if (typeof c === "string") return { name:c, qty:1 };
-        if (c && c.name) return { name:c.name, qty:Number(c.quantity ?? c.count ?? 1) || 1 };
-        return null;
-      }).filter(Boolean);
-    }
-  }
-  return null;
-};
 const parseDate = v => {
   if (v==null) return null;
   if (typeof v==="number") return new Date(v>1e12?v:v*1000);
   const d = new Date(v); return isNaN(d)?null:d;
 };
-const monthsAgo = n => { const d=new Date(); d.setMonth(d.getMonth()-n); return d; };
+const normName = s => String(s||"").toLowerCase().split(" // ")[0].normalize("NFKD").replace(/[^a-z0-9]+/g,"");
+const normUrl = u => {
+  if (!u || typeof u!=="string" || !/^https?:\/\//i.test(u.trim())) return null;
+  return u.trim().toLowerCase().replace(/^https?:\/\//,"").replace(/^www\./,"").replace(/[?#].*$/,"").replace(/\/+$/,"");
+};
+const sameSet = (a, b) => a.length===b.length && a.every(x => b.includes(x));
 
+// ---------------------------------------------------------------- step 1: edhtop16 entries
+async function findCommander(names, filters){
+  const sorted = [...names].sort((a,b)=> a<b?-1:a>b?1:0); // edhtop16 joins partners alphabetically
+  const cands = [sorted.join(" / ")];
+  if (sorted.length===2) cands.push([sorted[1],sorted[0]].join(" / "));
+  let last = "";
+  for (const cand of cands){
+    const j = await edh("entries", { commander:cand, ...filters });
+    const c = j && j.data && j.data.commander;
+    if (c && c.entries) return { name:cand, node:c };
+    const msg = j && j.errors ? errText(j.errors) : "";
+    if (msg && !/no rows/i.test(msg)) throw new Error(msg);
+    last = msg;
+  }
+  return null;
+}
+
+const mapEntry = n => ({
+  id: n.id || null,
+  pilot: (n.player && n.player.name) || n.playerName || null,
+  tournament: (n.tournament && n.tournament.name) || "unknown event",
+  tid: n.tournament ? (n.tournament.TID || n.tournament.tid || null) : null,
+  size: n.tournament ? (n.tournament.size ?? null) : null,
+  date: parseDate(n.tournament ? n.tournament.tournamentDate : null),
+  standing: n.standing ?? null,
+  url: n.decklistUrl || (typeof n.decklist==="string" ? n.decklist : null),
+  cards: [],
+});
+
+async function fetchEntries(found, filters){
+  const out = [], seen = new Set();
+  const take = conn => { for (const e of (conn.edges||[])){ const n = e && e.node; if (!n) continue;
+    const k = n.id || JSON.stringify([n.standing, n.tournament && n.tournament.TID]);
+    if (!seen.has(k)){ seen.add(k); out.push(mapEntry(n)); } } };
+  let conn = found.node.entries; take(conn);
+  const cursors = new Set();
+  for (let p=0; p<25 && conn.pageInfo && conn.pageInfo.hasNextPage; p++){
+    const cursor = conn.pageInfo.endCursor;
+    if (!found.node.id){ state.note = "edhtop16 didn't return an id to page with — only the first page of entries was read."; break; }
+    if (!cursor || cursors.has(cursor)) break;
+    cursors.add(cursor);
+    $("status").textContent = `edhtop16: ${out.length} entries so far, reading more…`;
+    const j = await edh("entries_more", { id:found.node.id, count:200, cursor, ...filters });
+    const n = j && j.data && (j.data.node || j.data.commander);
+    if (!n || !n.entries){ state.note = "Paging stopped early: " + (j && j.errors ? errText(j.errors) : "no data"); break; }
+    conn = n.entries; take(conn);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- step 2: TopDeck decklists
+class Fatal extends Error {}
+async function topdeckStandings(tid, onWait){
+  if (tdCache.has(tid)){ const hit = tdCache.get(tid); if (hit instanceof Error) throw hit; return hit; }
+  for (let attempt=0; attempt<4; attempt++){
+    const res = await fetch(`${API}?topdeck=${encodeURIComponent(tid)}`);
+    const j = await readJson(res, "TopDeck gateway");
+    if (res.status===429 || (j && j.error==="RATE_LIMIT")){
+      const wait = Math.min(65, Math.max(2, Number(j && j.retryAfter) || 15));
+      for (let s=wait; s>0; s--){ onWait(s); await sleep(1000); }
+      continue;
+    }
+    if (j && j.error){
+      if (j.error==="NO_TOPDECK_KEY" || j.error==="BAD_TOPDECK_KEY"){ const e = new Fatal(j.message||j.error); e.code = j.error; throw e; }
+      const e = new Error(j.message || j.error);
+      if (j.error==="NOT_FOUND") tdCache.set(tid, e); // don't ask TopDeck again this session
+      throw e;
+    }
+    const list = Array.isArray(j) ? j : (j && (j.standings || (j.data && j.data.standings) || (Array.isArray(j.data) ? j.data : null))) || [];
+    tdCache.set(tid, list);
+    return list;
+  }
+  throw new Error("TopDeck kept rate-limiting — try again in a minute");
+}
+
+const cleanName = s => s.replace(/\s+\*[A-Za-z]+\*\s*$/,"").replace(/\s+\([A-Za-z0-9]{2,8}\)(\s+[\w★-]+)?\s*$/,"").replace(/\s+#\S+$/,"").trim();
+function parseDecklistText(txt){
+  let section = null; const commanders = [], cards = [];
+  for (const raw of txt.split(/\r?\n/)){
+    const line = raw.trim(); if (!line) continue;
+    const h = line.match(/^~~\s*(.+?)\s*~~$/) || line.match(/^\/\/\s*(.+)$/) || line.match(/^#+\s*(.+)$/) || line.match(/^([A-Za-z ]+):$/);
+    if (h){ section = h[1].toLowerCase(); continue; }
+    const m = line.match(/^(\d+)\s*x?\s+(.+)$/i); if (!m) continue;
+    const name = cleanName(m[2]); if (!name) continue;
+    const item = { name, qty: Number(m[1]) || 1 };
+    if (section && /command/.test(section)) commanders.push(item);
+    else if (!section || /main|deck/.test(section)) cards.push(item);
+  }
+  return { commanders, cards };
+}
+const toList = s => {
+  if (!s) return [];
+  if (Array.isArray(s)) return s.map(x => typeof x==="string" ? {name:x, qty:1}
+    : x && x.name ? {name:x.name, qty:Number(x.count ?? x.quantity ?? x.qty ?? 1) || 1} : null).filter(Boolean);
+  if (typeof s==="object") return Object.entries(s).map(([k,v]) => ({ name:(v && typeof v==="object" && v.name) || k,
+    qty: typeof v==="number" ? v : Number(v && (v.count ?? v.quantity ?? v.qty ?? 1)) || 1 }));
+  return [];
+};
+const pickKey = (o, keys) => { if (!o) return null; for (const k of keys) if (o[k]) return o[k]; return null; };
+function deckOf(st){
+  const r = { commanders:[], cards:[], url:null };
+  let d = st.deckObj || st.deckobj || st.deck;
+  if (typeof d==="string"){ try{ d = JSON.parse(d); }catch{ d = null; } }
+  if (d && typeof d==="object"){
+    r.commanders = toList(pickKey(d, ["Commanders","commanders","Commander","commander"])).map(c=>c.name);
+    r.cards = toList(pickKey(d, ["Mainboard","mainboard","Main","main","Maindeck","maindeck","Deck","deck"]));
+  }
+  const dl = typeof st.decklist==="string" ? st.decklist.trim() : "";
+  if (/^https?:\/\//i.test(dl)) r.url = dl;
+  else if (dl && !r.cards.length){ const p = parseDecklistText(dl); r.cards = p.cards; if (!r.commanders.length) r.commanders = p.commanders.map(c=>c.name); }
+  if (!r.commanders.length && st.leader) r.commanders = String(st.leader).split(/\s+(?:\/|\+|&)\s+/).map(s=>s.trim()).filter(Boolean);
+  return r;
+}
+
+// Match each edhtop16 entry to its TopDeck standing: same decklist link, else same standing with the
+// same commanders, else the nearest standing on the same commanders.
+function attachDecks(entries, standings, cmdKeys){
+  const parsed = standings.map((st,i) => ({ i, standing:Number(st.standing ?? st.rank ?? st.place ?? i+1),
+    name: st.name || null, d: deckOf(st) }));
+  const used = new Set();
+  const cmdOk = p => p.d.commanders.length ? sameSet(p.d.commanders.map(normName), cmdKeys) : null;
+  for (const e of entries){
+    const u = normUrl(e.url);
+    let hit = u && parsed.find(p => !used.has(p.i) && p.d.url && normUrl(p.d.url)===u && p.d.cards.length);
+    if (!hit) hit = parsed.find(p => !used.has(p.i) && p.standing===e.standing && cmdOk(p)!==false);
+    if (!hit) hit = parsed.filter(p => !used.has(p.i) && cmdOk(p)===true)
+      .sort((a,b)=>Math.abs(a.standing-e.standing)-Math.abs(b.standing-e.standing))[0];
+    if (!hit){ e.why = "not found in TopDeck standings"; continue; }
+    used.add(hit.i);
+    if (!e.pilot && hit.name) e.pilot = hit.name;
+    if (!hit.d.cards.length){ e.why = hit.d.url ? "TopDeck has only a link for this list" : "no decklist on TopDeck"; if (!e.url && hit.d.url) e.url = hit.d.url; continue; }
+    e.cards = hit.d.cards;
+  }
+}
+
+// ---------------------------------------------------------------- run
 async function classifyLands(names){
   const landSet = new Set();
   const list = [...names];
@@ -191,7 +313,7 @@ async function classifyLands(names){
         landSet.add(c.name.split(" // ")[0]);
       }
     }
-    if (i+75 < list.length) await new Promise(r=>setTimeout(r,120));
+    if (i+75 < list.length) await sleep(120);
   }
   return landSet;
 }
@@ -200,86 +322,95 @@ async function finishLoad(entries){
   state.landWarn = false;
   const names = new Set();
   for (const e of entries) for (const c of e.cards) names.add(c.name);
-  try{
-    $("status").textContent = `Classifying ${names.size} unique cards via Scryfall…`;
-    state.landSet = await classifyLands(names);
-  }catch(err){
-    state.landSet = null; state.landWarn = true;
+  if (names.size){
+    try{
+      $("status").textContent = `Classifying ${names.size} unique cards via Scryfall…`;
+      state.landSet = await classifyLands(names);
+    }catch(err){
+      state.landSet = null; state.landWarn = true;
+    }
   }
   state.entries = entries;
   render();
 }
 
 async function run(){
-  $("run").disabled = true; $("errbox").style.display="none"; $("results").style.display="none";
-  state.apiName = null;
-  $("status").textContent = "Contacting edhtop16…";
-  const c1 = $("commander").value.trim();
-  const c2 = ($("partnerWrap").style.display!=="none") ? $("partner").value.trim() : "";
-  let candidates;
-  if (c1.includes(" / ")) candidates = [c1];
-  else if (c2) candidates = [`${c1} / ${c2}`, `${c2} / ${c1}`];
-  else candidates = [c1];
-  const tp = $("tp").value;
-  const minSize = +$("minSize").value, maxStanding = +$("maxStanding").value;
-  let works = null, lastErr = "";
-  for (const cand of candidates){
-    outer:
-    for (const useFilters of [true,false]) for (const cf of CARD_FIELDS){
-      const q = buildQuery(cf, useFilters);
-      const vars = useFilters ? {name:cand, first:5, after:null, tp, minSize, maxStanding} : {name:cand, first:5, after:null};
-      try{
-        const d = await gql(q, vars);
-        if (d && d.commander && d.commander.entries){ works = {q, useFilters, name:cand}; break outer; }
-        lastErr = "commander not found on edhtop16 — check spelling (pairing order is retried automatically)";
-      }catch(e){
-        lastErr = String(e.message);
-        if (!e.graphql){ showError(lastErr); return done(); }
-      }
-    }
-    if (works) break;
-  }
-  if (!works){ showError("No results. Last error: " + lastErr); return done(); }
-  const name = works.name;
-  const all = []; let after = null;
+  $("run").disabled = true; $("errbox").style.display="none"; $("errbox").innerHTML=""; $("results").style.display="none";
+  state.apiName = null; state.missing = []; state.note = ""; state.entries = null;
   try{
-    for (let p=0; p<12; p++){
-      $("status").textContent = `Fetching page ${p+1}… (${all.length} entries so far)`;
-      const vars = works.useFilters ? {name, first:50, after, tp, minSize, maxStanding} : {name, first:50, after};
-      const d = await gql(works.q, vars);
-      const conn = d && d.commander && d.commander.entries; if (!conn) break;
-      if (d.commander.name) state.apiName = d.commander.name;
-      for (const {node} of (conn.edges||[])){
-        all.push({ pilot:(node.player&&node.player.name)||"unknown",
-          tournament:(node.tournament&&node.tournament.name)||"unknown event",
-          size:node.tournament?node.tournament.size:null,
-          date:parseDate(node.tournament?node.tournament.tournamentDate:null),
-          standing:node.standing==null?null:node.standing,
-          cards:extractCards(node)||[] });
-      }
-      if (!conn.pageInfo || !conn.pageInfo.hasNextPage) break;
-      after = conn.pageInfo.endCursor;
+    const c1 = $("commander").value.trim();
+    const c2 = ($("partnerWrap").style.display!=="none") ? $("partner").value.trim() : "";
+    if (!c1){ showError("Type a commander first."); return; }
+    const names = c1.includes(" / ") ? c1.split(" / ").map(s=>s.trim()).filter(Boolean) : (c2 ? [c1, c2] : [c1]);
+    const minSize = Number($("minSize").value) || 0, maxStanding = Number($("maxStanding").value) || null;
+    const filters = { minEventSize:minSize, timePeriod:$("tp").value, sortBy:"NEW", maxStanding };
+
+    $("status").textContent = "Finding the field on edhtop16…";
+    const found = await findCommander(names, filters);
+    if (!found){ showError(`edhtop16 has no results for "${names.join(" / ")}" — check the spelling (exact card names; partners in either order).`); return; }
+    state.apiName = found.name;
+    let entries = await fetchEntries(found, filters);
+    entries = entries.filter(e => (e.size==null || e.size>=minSize) && (maxStanding==null || e.standing==null || e.standing<=maxStanding));
+    if (!entries.length){ showError("No qualifying lists in that window — loosen the filters."); return; }
+
+    const cmdKeys = found.name.split(" / ").map(normName);
+    const byTid = new Map();
+    for (const e of entries){
+      if (!e.tid){ e.why = "edhtop16 gave no event id"; continue; }
+      if (!byTid.has(e.tid)) byTid.set(e.tid, []);
+      byTid.get(e.tid).push(e);
     }
-  }catch(e){ showError("Pagination stopped early: " + e.message); }
-  let final = all;
-  state.clientFiltered = false;
-  if (!works.useFilters){
-    const cutoff = monthsAgo(tp==="ONE_MONTH"?1:tp==="THREE_MONTHS"?3:tp==="SIX_MONTHS"?6:12);
-    final = all.filter(e =>
-      (e.size==null || e.size>=minSize) &&
-      (e.standing==null || e.standing<=maxStanding) &&
-      (e.date==null || e.date>=cutoff));
-    state.clientFiltered = true;
+    const tids = [...byTid.keys()];
+    const gap = tids.length > 40 ? 1300 : 150; // TopDeck allows 50 standings reads a minute
+    let k = 0;
+    try{
+      for (const tid of tids){
+        k++;
+        const label = `Decklists from TopDeck: event ${k} of ${tids.length}…`;
+        $("status").textContent = label;
+        try{
+          const st = await topdeckStandings(tid, s => { $("status").textContent = `${label} (TopDeck rate limit — waiting ${s}s)`; });
+          attachDecks(byTid.get(tid), st, cmdKeys);
+        }catch(err){
+          if (err instanceof Fatal) throw err;
+          for (const e of byTid.get(tid)) e.why = String(err.message || err);
+        }
+        if (k < tids.length && !tdCache.has(tids[k])) await sleep(gap);
+      }
+    }catch(err){
+      if (!(err instanceof Fatal)) throw err;
+      for (const e of entries) if (!e.cards.length && !e.why) e.why = "decklist not loaded";
+      state.missing = entries;
+      if (err.code==="NO_TOPDECK_KEY") showSetup();
+      else showError(err.message);
+      state.entries = [];
+      render();
+      return;
+    }
+    const withCards = entries.filter(e => e.cards.length);
+    state.missing = entries.filter(e => !e.cards.length);
+    if (!withCards.length){ showError(`Found ${entries.length} qualifying entries, but TopDeck had no decklists for any of them.`); }
+    await finishLoad(withCards);
+  }catch(err){
+    showError(String((err && err.message) || err) || "unknown error");
+  }finally{
+    done();
   }
-  final = final.filter(e => e.cards.length>0);
-  if (!final.length && !$("errbox").textContent) showError("Query worked but returned zero qualifying lists — loosen the filters or check the commander name.");
-  await finishLoad(final);
-  done();
 }
 function done(){ $("run").disabled=false; $("status").textContent=""; }
 function showError(msg){ const b=$("errbox"); b.textContent=msg; b.style.display="block"; }
+function showSetup(){
+  const b=$("errbox");
+  b.innerHTML = `<b>One-time setup: TopDeck API key.</b> edhtop16 stopped serving decklists on Oct 19, so lists now come from TopDeck's official API.
+  <ol><li>Get a free key at <a href="https://topdeck.gg/developers" target="_blank" rel="noopener">topdeck.gg/developers</a>.</li>
+  <li>Cloudflare dashboard → Workers &amp; Pages → this project → Settings → Variables and Secrets → Add: type <b>Secret</b>, name <b>TOPDECK_API_KEY</b>, value = the key.</li>
+  <li>Deployments → latest → Retry deployment (secrets apply on the next deploy).</li></ol>
+  The qualifying entries are listed below with their decklist links in the meantime.`;
+  b.style.display="block";
+}
 
 $("run").onclick = run;
+$("tell").addEventListener("change", () => { if (state.entries && state.entries.length) render(); });
 $("loadPaste").onclick = async () => {
   const blocks = $("paste").value.split(/\n(?=#)/).map(b=>b.trim()).filter(Boolean);
   const out = [];
@@ -294,7 +425,7 @@ $("loadPaste").onclick = async () => {
   }
   if (!out.length){ showError("No lists found — start each list with a # header line."); return; }
   $("errbox").style.display="none";
-  state.clientFiltered = false; state.apiName = null;
+  state.apiName = null; state.missing = []; state.note = "";
   $("loadPaste").disabled = true;
   await finishLoad(out);
   $("loadPaste").disabled = false;
@@ -308,9 +439,10 @@ function analyze(){
   const cmdNames = cmdSource.split(" / ").map(s=>s.trim()).filter(Boolean);
   const cmdCount = Math.max(1, cmdNames.length);
   const slots = Math.max(1, 100 - cmdCount); // 99 solo, 98 partners
+  const cmdKeys = cmdNames.map(normName);
   // strip commanders, then infer hidden basic-land copies from each list's card deficit
   const cleaned = entries.map(e => {
-    const cards = e.cards.filter(c=>!cmdNames.includes(c.name)).map(c=>({...c}));
+    const cards = e.cards.filter(c=>!cmdNames.includes(c.name) && !cmdKeys.includes(normName(c.name))).map(c=>({...c}));
     const tot = cards.reduce((s,c)=>s+c.qty,0);
     const deficit = slots - tot;
     if (deficit > 0){
@@ -397,18 +529,38 @@ const TIER_META = t => ({
   FRINGE:{label:"Fringe / one-offs", color:"var(--dim)"},
 }[t]);
 
-function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;"); }
+function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;"); }
+const safeHref = u => /^https?:\/\//i.test(u||"") ? esc(u) : null;
+
+function entryHtml(e, slots, analyzed){
+  const tot = e.cards.reduce((s,c)=>s+c.qty,0);
+  const lands = e.cards.reduce((s,c)=> s + (isLand(c.name)?c.qty:0), 0);
+  const href = safeHref(e.url);
+  const meta = `${esc(e.tournament)}${e.size?` · ${e.size} players`:""}${e.standing?` · #${e.standing}`:""}${e.date?` · ${e.date.toLocaleDateString()}`:""}`;
+  const tail = analyzed ? ` · ${tot} cards · ${lands} lands${tot!==slots?" ⚠️":""}` : ` · ⚠️ ${esc(e.why||"no decklist")}`;
+  return `<div class="entry${analyzed?"":" miss"}"><b>${esc(e.pilot||"unknown pilot")}</b>${href?` · <a href="${href}" target="_blank" rel="noopener">list</a>`:""}
+    <div class="meta">${meta}${tail}</div></div>`;
+}
 
 function render(){
-  const A = analyze(); if (!A) return;
+  const A = analyze();
   $("results").style.display = "block";
   let chips = state.apiName ? `<span class="chip" style="color:var(--oil)">${esc(state.apiName)}</span>` : "";
+  if (!A){
+    chips += `<span class="chip">${state.missing.length} entries · no decklists loaded</span>`;
+    $("chips").innerHTML = chips;
+    document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("on", x.dataset.tab==="lists"));
+    state.tab = "lists";
+    $("pane").innerHTML = state.missing.map(e=>entryHtml(e, 0, false)).join("") || "";
+    return;
+  }
   chips += `<span class="chip">${A.cleaned.length} lists</span>`;
+  if (state.missing.length) chips += `<span class="chip" style="color:var(--warn);border-color:var(--warn)">${state.missing.length} without a decklist</span>`;
   if (A.tell) chips += `<span class="chip" style="color:var(--blue)">${A.NA} with tell</span>
     <span class="chip" style="color:var(--warn)">${A.NB} without</span>`;
   if (A.dupPairs) chips += `<span class="chip" style="color:var(--warn);border-color:var(--warn)">${A.dupPairs} identical duplicate${A.dupPairs>1?"s":""}</span>`;
-  if (state.clientFiltered) chips += `<span class="chip" style="color:var(--dim)">filtered client-side</span>`;
   if (state.landWarn) chips += `<span class="chip" style="color:var(--err);border-color:var(--err)">Scryfall unreachable — land targeting limited to basics</span>`;
+  if (state.note) chips += `<span class="chip" style="color:var(--warn);border-color:var(--warn)">${esc(state.note)}</span>`;
   $("chips").innerHTML = chips;
   const pane = $("pane");
   if (state.tab==="tiers"){
@@ -428,22 +580,19 @@ function render(){
     }
     pane.innerHTML = h;
   } else if (state.tab==="lists"){
-    pane.innerHTML = A.cleaned.map(e=>{
-      const tot = e.cards.reduce((s,c)=>s+c.qty,0);
-      const lands = e.cards.reduce((s,c)=> s + (isLand(c.name)?c.qty:0), 0);
-      return `<div class="entry"><b>${esc(e.pilot)}</b>
-      <div class="meta">${esc(e.tournament)}${e.size?` · ${e.size} players`:""}${e.standing?` · #${e.standing}`:""}${e.date?` · ${e.date.toLocaleDateString()}`:""} · ${tot} cards · ${lands} lands${tot!==A.slots?" ⚠️":""}</div></div>`;
-    }).join("");
+    pane.innerHTML = A.cleaned.map(e=>entryHtml(e, A.slots, true)).join("")
+      + state.missing.map(e=>entryHtml(e, A.slots, false)).join("");
   } else {
     const mox = cards => [...A.cmdNames.map(c=>`1 ${c}`), ...cards.map(c=>`${c.qty} ${c.name}`)].join("\n");
-    const block = (c, label, key) => `<div class="panel"><div class="flexbtw">
+    const block = (c, label) => `<div class="panel"><div class="flexbtw">
       <div style="font-weight:700;font-size:13px">${esc(label)}</div>
-      <button class="copybtn" onclick="copyText(this, \`${mox(c.cards).replace(/`/g,"")}\`)">Copy Moxfield 100</button></div>
+      <button class="copybtn" data-copy="${esc(mox(c.cards))}">Copy Moxfield 100</button></div>
       <div class="sub" style="margin:8px 0">${c.nonlandCount} nonland + ${c.landCount} lands + ${A.cmdCount} commander${A.cmdCount>1?"s":""} = ${c.nonlandCount+c.landCount+A.cmdCount}. Land count = the camp's real average. Sanity-check the tail slots.</div>
       <div class="conslist">${c.cards.map(x=> x.qty>1 ? `${esc(x.name)} ×${x.qty}` : esc(x.name)).join(" · ")}</div></div>`;
-    let h = block(A.consA, A.tell?`With "${$("tell").value.trim()}" (${A.NA} lists)`:`Combined field (${A.NA} lists)`, "A");
-    if (A.tell && A.NB) h += block(A.consB, `Without "${$("tell").value.trim()}" (${A.NB} lists)`, "B");
+    let h = block(A.consA, A.tell?`With "${$("tell").value.trim()}" (${A.NA} lists)`:`Combined field (${A.NA} lists)`);
+    if (A.tell && A.NB) h += block(A.consB, `Without "${$("tell").value.trim()}" (${A.NB} lists)`);
     pane.innerHTML = h;
+    pane.querySelectorAll("[data-copy]").forEach(btn => btn.onclick = () => copyText(btn, btn.dataset.copy));
   }
 }
 
